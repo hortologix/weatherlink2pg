@@ -31,7 +31,6 @@ load_dotenv()
 # Clés API :
 API_key = os.getenv("WEATHERLINK2PG_API_KEY")
 API_secret = os.getenv("WEATHERLINK2PG_API_SECRET")
-# station_ID = os.getenv("WEATHERLINK2PG_API_STATIONID")
 
 # Paramètres de connexion à la base de données PostgreSQL en local :
 host = os.getenv("WEATHERLINK2PG_PG_HOST", default="localhost")
@@ -43,25 +42,139 @@ table_name = os.getenv("WEATHERLINK2PG_PG_TABLE", default="data")
 schema_name = os.getenv("WEATHERLINK2PG_PG_SCHEMA", default=None)
 relation = f"{schema_name}.{table_name}" if schema_name else table_name
 
-# CHANGED (common table) : nom de la table fusionnée des champs communs.
+# Noms des tables créées par l'application :
 COMMON_TABLE_NAME = "weatherlink_common"
+FIELD_CATALOG_TABLE_NAME = "weatherlink_field_catalog"
+SPECIFIC_TABLE_NAME = "weatherlink_specific"
 
-# --- CHANGED (archive_only) -----------------------------------------------
 # Types de structure correspondant à des « Archive record »
 # (cf. https://weatherlink.github.io/v2-api/data-structure-types) :
 #   3, 4  : WeatherLink IP / Vantage Connect Archive (Rev A / B)
 #   7     : EnviroMonitor ISS Archive
-#   11    : WeatherLink Live ISS Archive
-#   13    : WeatherLink Live non-ISS Archive
+#   11, 13 : WeatherLink Live ISS / non-ISS Archive
 #   17    : AirLink Archive
 #   20, 22, 24, 26 : WeatherLink Console Archive
-#   19    : (Barometer Archive, famille Console - conservé si utile)
 # Les enregistrements « Current Conditions » et « Health » sont exclus.
 ARCHIVE_TYPES = {3, 4, 7, 11, 13, 17, 20, 22, 24, 26}
-# --- END CHANGED -----------------------------------------------------------
+
+# Colonnes techniques exclues des comparaisons de champs entre types :
+EXCLUDED = {
+    "station_id",
+    "ts",
+    "data_structure_type",
+    "infos_json",
+}
+
+# Types SQL des tables écrites en base :
+DTYPE_PER_TYPE = {
+    "station_id": INTEGER,
+    "ts": BIGINT,
+    "data_structure_type": INTEGER,
+    "infos_json": JSONB,
+}
+DTYPE_COMMON = {
+    "station_id": INTEGER,
+    "ts": BIGINT,
+    "data_structure_type": INTEGER,
+}
+DTYPE_CATALOG = {
+    "data_structure_type": INTEGER,
+    "table_name": TEXT,
+    "field_name": TEXT,
+    "data_type": TEXT,
+    "min_value": NUMERIC,
+    "max_value": NUMERIC,
+    "non_null_count": INTEGER,
+    "total_count": INTEGER,
+    "in_common_table": BOOLEAN,
+}
+DTYPE_SPECIFIC = {
+    "station_id": INTEGER,
+    "data_structure_type": INTEGER,
+    "field_name": TEXT,
+    "value_text": TEXT,
+}
 
 
-# 3 : Définitions :
+# 3 : Petits utilitaires partagés :
+def _rel(table: str) -> str:
+    """Nom qualifié schéma.table d'une relation, pour SQL et affichage."""
+    return f"{schema_name or 'public'}.{table}"
+
+
+def _query(sql: str, params=None, commit: bool = False) -> list[tuple]:
+    """Exécute une requête SQL et renvoie les lignes résultat.
+
+    Centralise la connexion psycopg2 (cursor, exécution, fermeture).
+    """
+    conn = psycopg2.connect(
+        dbname=database,
+        user=user,
+        password=password,
+        host=host,
+        port=port,
+    )
+    try:
+        cur = conn.cursor()
+        cur.execute(sql, params)
+        rows = cur.fetchall() if cur.description else []
+        if commit:
+            conn.commit()
+        cur.close()
+    finally:
+        conn.close()
+    return rows
+
+
+def _api_get(url: str):
+    """Requête GET authentifiée vers l'API Weatherlink ; JSON ou None."""
+    headers = {"X-Api-Secret": API_secret}
+    r = requests.get(url, headers=headers, timeout=60)
+    if r.status_code == 200:
+        return r.json()
+    echo_failure(
+        f"La requête {url} a échoué, code erreur :"
+        f" {r.status_code} / {r.json()}"
+    )
+    return None
+
+
+def _common_cols(df_ajout: dict[str, pd.DataFrame]) -> set:
+    """Champs communs à tous les types, hors colonnes techniques."""
+    if not df_ajout:
+        return set()
+    return (
+        set.intersection(*[set(df.columns) for df in df_ajout.values()])
+        - EXCLUDED
+    )
+
+
+def _concat_into(mapping: dict, key: str, df: pd.DataFrame) -> None:
+    """Ajoute `df` à `mapping[key]` (concaténation si déjà présent)."""
+    if key in mapping:
+        mapping[key] = pd.concat([mapping[key], df], ignore_index=True)
+    else:
+        mapping[key] = df
+
+
+def _make_echo(color: str):
+    """Fabrique une fonction d'affichage coloré pour click."""
+
+    def echo(message: str) -> None:
+        """Affiche le message dans la couleur donnée."""
+        text = message.replace("\n                     ", "")
+        click.echo(click.style(text, fg=color))
+
+    return echo
+
+
+echo_success = _make_echo("green")
+echo_info = _make_echo("blue")
+echo_default = _make_echo("white")
+echo_failure = _make_echo("red")
+
+
+# 4 : Définitions :
 def today_ts():
     """Récupération de la date du jour à 00h00 en TS pour utilisation comme
     date de fin avec l'API."""
@@ -79,9 +192,8 @@ def start_station(since: str):
     return start_day, if_exists
 
 
-# --- CHANGED (data_structure_type support) -------------------------------
 def table_name_for(data_structure_type) -> str:
-    """CHANGED: nom de table dédié à un type de structure de données.
+    """Nom de table dédié à un type de structure de données.
 
     Chaque `data_structure_type` est stocké dans sa propre table,
     nommée `{table_name}_ds{data_structure_type}` (ex: data_ds1).
@@ -91,89 +203,44 @@ def table_name_for(data_structure_type) -> str:
 
 
 def data_structure_tables() -> list[str]:
-    """CHANGED: liste des tables créées pour les différents
-    `data_structure_type` (tables `{table_name}_ds*`).
-    CHANGED (common table) : inclut également la table commune
-    `weatherlink_common` si elle existe."""
-    conn = psycopg2.connect(
-        dbname=database,
-        user=user,
-        password=password,
-        host=host,
-        port=port,
-    )
-    cur = conn.cursor()
-    cur.execute(
+    """Liste des tables créées pour les différents
+    `data_structure_type` (tables `{table_name}_ds*`), incluant la table
+    commune `weatherlink_common` si elle existe."""
+    rows = _query(
         """SELECT table_name FROM information_schema.tables
            WHERE table_schema = %s
              AND (table_name LIKE %s OR table_name = %s)""",
         (schema_name or "public", f"{table_name}\\_ds%", COMMON_TABLE_NAME),
     )
-    tables = [row[0] for row in cur.fetchall()]
-    cur.close()
-    conn.close()
-    return tables
-
-
-# --- END CHANGED ---------------------------------------------------------
+    return [row[0] for row in rows]
 
 
 def create_schema():
     """Create data schema if defined"""
     echo_success(f"CREATE SCHEMA {schema_name}")
-    conn = psycopg2.connect(
-        dbname=database,
-        user=user,
-        password=password,
-        host=host,
-        port=port,
-    )
-    cur = conn.cursor()
-
-    # Exécution d'une requête SQL et récupération de la TS :
-    cur.execute(f"CREATE SCHEMA IF NOT EXISTS {schema_name}")
-    conn.commit()
-    # Fermeture du curseur et de la connexion
-    cur.close()
-    conn.close()
+    _query(f"CREATE SCHEMA IF NOT EXISTS {schema_name}", commit=True)
 
 
 def last_ts_bdd():
     """Récupération de la dernière TS enregistrée dans la base de données.
 
-    CHANGED: la dernière TS est la plus grande valeur trouvée dans
-    l'ensemble des tables `{table_name}_ds*` et `weatherlink_common`.
+    La dernière TS est la plus grande valeur trouvée dans l'ensemble des
+    tables `{table_name}_ds*` et `weatherlink_common`.
     Si aucune table n'existe encore, renvoie (None, "append").
     """
     tables = data_structure_tables()
     if not tables:
         return None, "append"
 
-    # Connexion à la base de données
-    conn = psycopg2.connect(
-        dbname=database,
-        user=user,
-        password=password,
-        host=host,
-        port=port,
+    # Union des dernières TS de chaque table :
+    parts = (
+        f"SELECT ts FROM {_rel(t)} ORDER BY ts DESC LIMIT 1" for t in tables
     )
-    cur = conn.cursor()
-    # CHANGED: union des dernières TS de chaque table :
-    union_query = " UNION ALL ".join(
-        f"""SELECT ts FROM {f'{schema_name}.{t}' if schema_name else t} """
-        "ORDER BY ts DESC LIMIT 1"
-        for t in tables
-    )
-    cur.execute(f"SELECT max(ts) FROM ({union_query}) AS last_ts")
-    last_ts = cur.fetchone()[0]
+    union_query = " UNION ALL ".join(parts)
+    rows = _query(f"SELECT max(ts) FROM ({union_query}) AS last_ts")
+    last_ts = rows[0][0]
 
-    if_exists = "append"  # informations pour la BDD
-
-    # Fermeture du curseur et de la connexion
-    cur.close()
-    conn.close()
-
-    return last_ts, if_exists
+    return last_ts, "append"  # informations pour la BDD
 
 
 def list_stations() -> Optional[list[dict]]:
@@ -184,22 +251,14 @@ def list_stations() -> Optional[list[dict]]:
     }
     url = root_url + urllib.parse.urlencode(params)
 
-    headers = {"X-Api-Secret": API_secret}
-
-    # Requête :
-    r = requests.get(url, headers=headers, timeout=60)
-    if r.status_code == 200:
-        data = r.json()
+    data = _api_get(url)
+    if data:
         return data["stations"]
-    echo_failure(
-        f"La requête {url} a échoué, code erreur :"
-        f" {r.status_code} / {r.json()}"
-    )
     return None
 
 
 def get_stations_infos() -> None:
-    "Display stations main informations"
+    """Display stations main informations"""
     stations = list_stations()
     output = [
         f"""ID: {s["station_id"]} - NAME : {s['station_name']} """
@@ -215,15 +274,12 @@ def get_station_ids() -> Optional[list[int]]:
 
     stations = list_stations()
 
-    # Requête :
     station_ids = [str(station["station_id"]) for station in stations]
     echo_info(f"Existing stations ids are {', '.join(station_ids)}")
     return station_ids
 
 
-def fetch_station_data(
-    station: int, start_time: int, end_time: int
-) -> pd.DataFrame:
+def fetch_station_data(station: int, start_time: int, end_time: int) -> dict:
     """Fetch data for a specific station and time range."""
     root_url = f"https://api.weatherlink.com/v2/historic/{station}?"
     params = {
@@ -232,32 +288,24 @@ def fetch_station_data(
         "end-timestamp": end_time,
     }
     url = root_url + urllib.parse.urlencode(params)
-    headers = {"X-Api-Secret": API_secret}
 
-    r = requests.get(url, headers=headers, timeout=60)
-    if r.status_code == 200:
-        return r.json()
-    echo_failure(
-        f"La requête {url} a échoué, code erreur :"
-        f" {r.status_code} / {r.json()}"
-    )
-    return None
+    return _api_get(url)
 
 
 def process_station_data(data: dict) -> dict[str, pd.DataFrame]:
     """Process the JSON data for a station into one DataFrame per
     data structure type.
 
-    CHANGED (data_structure_type support) : la première version de
-    l'application supposait que les relevés météo se trouvaient toujours
-    dans le premier bloc d'items (`data["sensors"][0]["data"]`), modèle
-    valable pour l'ancien matériel. Or la position du bloc de relevés
-    dépend du `gateway_type` de la station : avec le nouveau capteur,
-    les données se trouvent plus bas dans la liste `sensors`, sous un
-    `data_structure_type` correspondant à une entrée « Archive record »
+    La première version de l'application supposait que les relevés
+    météo se trouvaient toujours dans le premier bloc d'items
+    (`data["sensors"][0]["data"]`), modèle valable pour l'ancien
+    matériel. Or la position du bloc de relevés dépend du `gateway_type`
+    de la station : avec le nouveau capteur, les données se trouvent
+    plus bas dans la liste `sensors`, sous un `data_structure_type`
+    correspondant à une entrée « Archive record »
     (cf. https://weatherlink.github.io/v2-api/data-structure-types).
 
-    On ne peut donc plus se fier à la position : chaque capteur (sensor)
+    On ne peut donc pas se fier à la position : chaque capteur (sensor)
     est parcouru et son `data_structure_type` est détecté. Le
     dictionnaire renvoyé associe chaque `data_structure_type` à un
     DataFrame contenant les données de tous les capteurs de ce type.
@@ -281,20 +329,13 @@ def process_station_data(data: dict) -> dict[str, pd.DataFrame]:
         df_jour = pd.DataFrame(
             {
                 "station_id": [data["station_id"]] * len(records),
-                # CHANGED: colonne traçant le type de structure de données :
+                # colonne traçant le type de structure de données :
                 "data_structure_type": [data_structure_type] * len(records),
                 "infos_json": records,
             }
         )
         df_sensors = pd.json_normalize(records)
-        df_sensor_data = pd.concat([df_jour, df_sensors], axis=1)
-
-        if dst in df_by_type:
-            df_by_type[dst] = pd.concat(
-                [df_by_type[dst], df_sensor_data], ignore_index=True
-            )
-        else:
-            df_by_type[dst] = df_sensor_data
+        _concat_into(df_by_type, dst, pd.concat([df_jour, df_sensors], axis=1))
 
     return df_by_type
 
@@ -305,16 +346,12 @@ def one_day_data(
     end_date_api: int,
     archive_only: bool = False,
 ) -> dict[str, pd.DataFrame]:
-    """Récupération des données jour/jour via l'API et optention d'une DF.
+    """Récupération des données jour/jour via l'API et obtention d'une
+    DataFrame par `data_structure_type`.
 
-    CHANGED (data_structure_type support): renvoie un dictionnaire
-    associant chaque `data_structure_type` à un DataFrame.
-
-    CHANGED (archive_only): si `archive_only` vaut True, seuls les types
-    de structure correspondant à des « Archive record » sont conservés
-    (cf. https://weatherlink.github.io/v2-api/data-structure-types) ;
-    les enregistrements « Current Conditions » et « Health » sont
-    ignorés.
+    Si `archive_only` vaut True, seuls les types de structure
+    correspondant à des « Archive record » sont conservés ; les
+    enregistrements « Current Conditions » et « Health » sont ignorés.
     """
     df_ajout: dict[str, pd.DataFrame] = {}
     nb_jours = int((end_date_api - start_date_api) / 86400)
@@ -327,61 +364,37 @@ def one_day_data(
 
             data = fetch_station_data(station, start_time, end_time)
             if data:
-                # CHANGED: un DataFrame par data_structure_type :
+                # un DataFrame par data_structure_type :
                 df_jour = process_station_data(data)
                 for dst, df in df_jour.items():
-                    # CHANGED (archive_only) : filtre des types « Archive
-                    # record » uniquement (Current Conditions et Health
-                    # exclus) :
                     if archive_only and int(dst) not in ARCHIVE_TYPES:
                         continue
-                    if dst in df_ajout:
-                        df_ajout[dst] = pd.concat(
-                            [df_ajout[dst], df], ignore_index=True
-                        )
-                    else:
-                        df_ajout[dst] = df
+                    _concat_into(df_ajout, dst, df)
 
     return df_ajout
 
 
-# --- CHANGED (data_structures.log) ----------------------------------------
 def write_data_structures_log(
     df_ajout: dict[str, pd.DataFrame],
     log_path: str = "data_structures.log",
 ) -> None:
-    """CHANGED (data_structures.log) : écrit, à des fins de débogage, la
-    structure JSON de chaque `data_structure_type` unique rencontré
-    dans le fichier `data_structures.log`.
+    """Écrit, à des fins de débogage, la structure JSON de chaque
+    `data_structure_type` unique rencontré dans `data_structures.log`.
 
     Pour chaque type sont consignés :
       - le type de structure (`data_structure_type`) ;
-      - la liste des champs (colonnes) du DataFrame associé ;
+      - la liste des champs (colonnes) du DataFrame associé, chaque
+        champ commun à TOUS les types présents étant marqué d'un "*" ;
       - un enregistrement JSON complet de la colonne `infos_json`
         (première ligne) servant d'exemple de structure.
-
-    CHANGED (marquage des champs communs) : dans la liste des champs,
-    chaque champ commun à TOUS les `data_structure_type` présents est
-    marqué d'un "*" (les colonnes techniques station_id, ts,
-    data_structure_type et infos_json sont exclues de ce calcul).
     """
-    # CHANGED (marquage des champs communs) : intersection des colonnes
-    # de tous les types, hors colonnes techniques :
-    excluded = {"station_id", "ts", "data_structure_type", "infos_json"}
-    if df_ajout:
-        common_cols = (
-            set.intersection(*[set(df.columns) for df in df_ajout.values()])
-            - excluded
-        )
-    else:
-        common_cols = set()
+    common_cols = _common_cols(df_ajout)
 
     with open(log_path, "w", encoding="utf-8") as f:
         f.write(
             "Structures JSON par data_structure_type "
             f"({datetime.datetime.now().isoformat()})\n"
         )
-        # CHANGED (marquage des champs communs) : légende :
         f.write('Un "*" devant un champ indique qu\'il est commun à ')
         f.write("tous les data_structure_type présents.\n")
         f.write("=" * 72 + "\n\n")
@@ -391,8 +404,6 @@ def write_data_structures_log(
                 f"data_structure_type {dst} " f"({len(df)} enregistrements)\n"
             )
             f.write("-" * 72 + "\n")
-            # CHANGED (marquage des champs communs) : "*" devant chaque
-            # champ présent dans l'intersection de tous les types :
             f.write(
                 "Champs (colonnes) : "
                 + ", ".join(
@@ -417,39 +428,21 @@ def write_data_structures_log(
     echo_info(f"Structure JSON des types écrits dans {log_path}")
 
 
-# --- END CHANGED -----------------------------------------------------------
-
-
-# --- CHANGED (common table) ----------------------------------------------
 def build_common_frame(df_ajout: dict[str, pd.DataFrame]) -> pd.DataFrame:
-    """CHANGED (common table) : construit la DataFrame des champs communs.
+    """Construit la DataFrame des champs communs.
 
     - Les colonnes communes à TOUS les `data_structure_type` présents
       sont déterminées par intersection des colonnes des DataFrames.
     - Une seule ligne par (station_id, ts) : les valeurs des colonnes
-      communes sont agrégées (première valeur non nulle), et la colonne
-      `data_structure_type` contient la liste des types ayant produit un
-      enregistrement pour ce couple station/horodatage (ex: "1;11").
-    - Les colonnes `infos_json` et techniques sont exclues de la partie
-      "champs météo communs" (elles restent disponibles dans les tables
-      par type).
+      communes sont agrégées (première valeur non nulle) et
+      `data_structure_type` conserve le type principal (le plus petit
+      numéro). La liste complète des types par horodatage reste
+      disponible dans les tables par type `{table}_ds{type}`.
     """
     if not df_ajout:
         return pd.DataFrame()
 
-    # Colonnes exclues de l'intersection des champs météo :
-    excluded = {
-        "station_id",
-        "ts",
-        "data_structure_type",
-        "infos_json",
-    }
-
-    # Intersection des colonnes de tous les types de structure :
-    common_cols = (
-        set.intersection(*[set(df.columns) for df in df_ajout.values()])
-        - excluded
-    )
+    common_cols = _common_cols(df_ajout)
 
     frames = []
     for df in df_ajout.values():
@@ -463,12 +456,6 @@ def build_common_frame(df_ajout: dict[str, pd.DataFrame]) -> pd.DataFrame:
 
     # Une ligne par (station_id, ts) :
     agg = {col: "first" for col in sorted(common_cols)}
-    # CHANGED (int data_structure_type) : une ligne par (station_id, ts),
-    # avec data_structure_type en INTEGER. Si plusieurs types de structure
-    # ont produit un enregistrement pour le même couple station/horodatage,
-    # on conserve le type principal (le plus petit numéro). La liste
-    # complète des types par horodatage reste disponible dans les tables
-    # par type `{table}_ds{type}`.
     df_all["data_structure_type"] = df_all["data_structure_type"].astype(int)
     agg["data_structure_type"] = "min"
 
@@ -481,64 +468,40 @@ def build_common_frame(df_ajout: dict[str, pd.DataFrame]) -> pd.DataFrame:
 
 
 def verify_table_written(table: str, expected_rows: int) -> None:
-    """CHANGED (logging) : vérifie en base qu'une table existe et compte
-    ses lignes, pour confirmer que l'écriture a bien abouti.
+    """Vérifie en base qu'une table existe et compte ses lignes, pour
+    confirmer que l'écriture a bien abouti.
 
     Interroge information_schema (existence) puis COUNT(*) (lignes
     réellement présentes, pas une estimation).
     """
-    conn = psycopg2.connect(
-        dbname=database,
-        user=user,
-        password=password,
-        host=host,
-        port=port,
-    )
-    cur = conn.cursor()
-    cur.execute(
+    exists = _query(
         """SELECT EXISTS (
                SELECT 1 FROM information_schema.tables
                WHERE table_schema = %s AND table_name = %s
            )""",
         (schema_name or "public", table),
-    )
-    exists = cur.fetchone()[0]
+    )[0][0]
     if not exists:
         echo_failure(
-            f"VÉRIFICATION ÉCHOUÉE : la table "
-            f"{schema_name + '.' if schema_name else ''}{table} "
+            f"VÉRIFICATION ÉCHOUÉE : la table {_rel(table)} "
             f"n'existe PAS dans la base '{database}' sur {host}:{port} !"
         )
     else:
-        schema = schema_name or "public"
-        cur.execute(f'SELECT COUNT(*) FROM "{schema}"."{table}"')
-        n = cur.fetchone()[0]
+        n = _query(f"SELECT COUNT(*) FROM {_rel(table)}")[0][0]
         echo_success(
-            f"Vérifié : {schema_name + '.' if schema_name else ''}{table} "
-            f"existe, {n} lignes en base "
+            f"Vérifié : {_rel(table)} existe, {n} lignes en base "
             f"({expected_rows} lignes attendues)"
         )
-    cur.close()
-    conn.close()
 
 
 def log_db_tables() -> None:
-    """CHANGED (logging) : affiche, en interrogeant directement la base,
-    les tables du schéma cible et leur nombre de lignes.
+    """Affiche, en interrogeant directement la base, les tables du
+    schéma cible et leur nombre de lignes.
 
-    Permet de vérifier depuis les logs que les tables existent réellement
-    dans la base où le script écrit (et pas seulement que `to_sql` n'a
-    pas levé d'erreur).
+    Permet de vérifier depuis les logs que les tables existent
+    réellement dans la base où le script écrit.
     """
-    conn = psycopg2.connect(
-        dbname=database,
-        user=user,
-        password=password,
-        host=host,
-        port=port,
-    )
-    cur = conn.cursor()
-    cur.execute(
+    rows = _query(
         """SELECT c.relname, c.reltuples::bigint
            FROM pg_class c
            JOIN pg_namespace n ON n.oid = c.relnamespace
@@ -547,9 +510,6 @@ def log_db_tables() -> None:
            ORDER BY c.relname""",
         (schema_name or "public",),
     )
-    rows = cur.fetchall()
-    cur.close()
-    conn.close()
 
     if not rows:
         echo_failure(
@@ -567,17 +527,9 @@ def log_db_tables() -> None:
         echo_info(f"  - {relname} (~{n_rows} lignes)")
 
 
-# --- CHANGED (field catalog) ---------------------------------------------
-FIELD_CATALOG_TABLE_NAME = "weatherlink_field_catalog"
-
-# CHANGED (specific table) : nom de la table des champs NON communs.
-SPECIFIC_TABLE_NAME = "weatherlink_specific"
-
-
 def build_field_catalog(df_ajout: dict[str, pd.DataFrame]) -> pd.DataFrame:
-    """CHANGED (field catalog) : construit un catalogue de champs par
-    data_structure_type, pour comparer visuellement les champs de chaque
-    type de structure.
+    """Construit un catalogue de champs par `data_structure_type`, pour
+    comparer visuellement les champs de chaque type de structure.
 
     Une ligne par (data_structure_type, champ) avec :
       - data_structure_type : type de structure de données
@@ -591,28 +543,13 @@ def build_field_catalog(df_ajout: dict[str, pd.DataFrame]) -> pd.DataFrame:
       - in_common_table     : le champ fait-il partie des champs communs
                               écrits dans `weatherlink_common` ?
     """
-    excluded = {
-        "station_id",
-        "ts",
-        "data_structure_type",
-        "infos_json",
-    }
-    # Champs communs = intersection des colonnes de tous les types :
-    if df_ajout:
-        common_cols = (
-            set.intersection(*[set(df.columns) for df in df_ajout.values()])
-            - excluded
-        )
-    else:
-        common_cols = set()
+    common_cols = _common_cols(df_ajout)
 
     rows = []
     for dst, df in df_ajout.items():
         for col in df.columns:
             s = df[col]
             row = {
-                # CHANGED (int data_structure_type) : cast en entier
-                # (les clés du dictionnaire sont des chaînes) :
                 "data_structure_type": int(dst),
                 "table_name": table_name_for(dst),
                 "field_name": col,
@@ -632,44 +569,27 @@ def build_field_catalog(df_ajout: dict[str, pd.DataFrame]) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-# --- END CHANGED ---------------------------------------------------------
-
-
-# --- CHANGED (specific table) --------------------------------------------
 def build_specific_frame(df_ajout: dict[str, pd.DataFrame]) -> pd.DataFrame:
-    """CHANGED (specific table) : construit la DataFrame des valeurs NON
-    communes, en format « long », complément de `weatherlink_common`.
+    """Construit la DataFrame des valeurs NON communes, complément de
+    `weatherlink_common`.
 
-    CHANGED (unique combos) : sans l'horodatage — une ligne par
-    combinaison unique (station_id, data_structure_type, field_name,
-    value_text), c'est-à-dire l'ensemble distinct des valeurs prises par
-    chaque champ non commun pour chaque station et type de structure.
+    Une ligne par combinaison unique (station_id,
+    data_structure_type, field_name, value_text) : l'ensemble distinct
+    des valeurs prises par chaque champ non commun, pour chaque station
+    et chaque type de structure.
     """
-    excluded = {
-        "station_id",
-        "ts",
-        "data_structure_type",
-        "infos_json",
-    }
-    # Champs communs = intersection des colonnes de tous les types :
-    if df_ajout:
-        common_cols = (
-            set.intersection(*[set(df.columns) for df in df_ajout.values()])
-            - excluded
-        )
-    else:
-        common_cols = set()
+    common_cols = _common_cols(df_ajout)
 
     frames = []
     for df in df_ajout.values():
         # Champs spécifiques à ce type = colonnes non communes :
         specific_cols = [
-            c for c in df.columns if c not in common_cols and c not in excluded
+            c for c in df.columns if c not in common_cols and c not in EXCLUDED
         ]
         if not specific_cols:
             continue
-        # Mise au format long : une ligne par (station, ts, champ) ;
-        # l'horodatage n'est pas conservé (voir dédoublonnage ci-dessous) :
+        # Mise au format long : une ligne par (station, champ) ;
+        # l'horodatage n'est pas conservé :
         df_long = df.melt(
             id_vars=["station_id", "data_structure_type"],
             value_vars=specific_cols,
@@ -679,8 +599,7 @@ def build_specific_frame(df_ajout: dict[str, pd.DataFrame]) -> pd.DataFrame:
         df_long["value_text"] = df_long["value_text"].astype(str)
         # astype(str) transforme aussi les NaN en "nan" ; on nettoie :
         df_long.loc[df_long["value_text"] == "nan", "value_text"] = None
-        # CHANGED (unique combos) : dédoublonnage sur la combinaison
-        # (station_id, data_structure_type, field_name, value_text) :
+        # Dédoublonnage de la combinaison :
         df_long = df_long.drop_duplicates(
             subset=[
                 "station_id",
@@ -703,189 +622,94 @@ def build_specific_frame(df_ajout: dict[str, pd.DataFrame]) -> pd.DataFrame:
     return pd.concat(frames, ignore_index=True)
 
 
-# --- END CHANGED ---------------------------------------------------------
+def _write_table(
+    df: pd.DataFrame,
+    table: str,
+    engine,
+    if_exists: str,
+    dtype: dict,
+) -> None:
+    """Écrit une DataFrame dans une table puis vérifie en base."""
+    echo_info(f"Writing {len(df)} rows to table {_rel(table)}")
+    df.to_sql(
+        table,
+        engine,
+        if_exists=if_exists,
+        index=False,
+        dtype=dtype,
+        schema=schema_name,
+    )
+    verify_table_written(table, len(df))
 
 
 def up_to_bdd(df_ajout: dict[str, pd.DataFrame], if_exists: str):
     """Ajout des données dans la BDD.
 
-    CHANGED (data_structure_type support): `df_ajout` est un dictionnaire
-    {data_structure_type: DataFrame}. Chaque type de structure de données
-    est écrit dans sa propre table `{table_name}_ds{data_structure_type}`.
-
-    CHANGED (common table): en plus des tables par type, une table
-    `weatherlink_common` est écrite : une ligne par (station_id, ts)
-    contenant les champs communs à tous les types de structure ainsi que
-    la liste des `data_structure_type` correspondants.
+    `df_ajout` est un dictionnaire {data_structure_type: DataFrame}.
+    Chaque type de structure de données est écrit dans sa propre table
+    `{table_name}_ds{data_structure_type}`. S'y ajoutent :
+      - `weatherlink_common` : champs communs à tous les types, une
+        ligne par (station_id, ts) ;
+      - `weatherlink_field_catalog` : catalogue des champs par type ;
+      - `weatherlink_specific` : valeurs des champs non communs.
     """
-    # Connexion de la chaîne de connexion PostgreSQL :
+    # Chaîne de connexion PostgreSQL :
     conn_str = f"postgresql://{user}:{password}@{host}:{port}/{database}"
     engine = create_engine(conn_str)
 
-    # CHANGED (logging) : affiche explicitement où le script écrit :
     echo_info(
         f"Connecting to PostgreSQL: host={host} port={port} "
         f"database='{database}' user='{user}' "
         f"schema='{schema_name or 'public'}'"
     )
 
-    # Définir les types de données pour chaque colonne :
-    # CHANGED: ajout de la colonne data_structure_type :
-    dtype = {
-        "station_id": INTEGER,
-        "ts": BIGINT,
-        "data_structure_type": INTEGER,
-        "infos_json": JSONB,
-    }
     if schema_name is not None:
         create_schema()
 
-    # CHANGED: une table par data_structure_type :
+    # Une table par data_structure_type :
     for dst, df in df_ajout.items():
-        dst_table = table_name_for(dst)
-        echo_info(
-            f"Writing {len(df)} rows of data_structure_type {dst} "
-            f"to table {schema_name + '.' if schema_name else ''}{dst_table}"
-        )
-        df.to_sql(
-            dst_table,
+        _write_table(
+            df,
+            table_name_for(dst),
             engine,
-            if_exists=if_exists,
-            index=False,
-            dtype=dtype,
-            schema=schema_name,
+            if_exists,
+            DTYPE_PER_TYPE,
         )
-        # CHANGED (logging) : vérification en base après chaque écriture :
-        verify_table_written(dst_table, len(df))
 
-    # CHANGED (common table): écriture de la table des champs communs :
+    # Table des champs communs :
     df_common = build_common_frame(df_ajout)
     if not df_common.empty:
-        echo_info(
-            f"Writing {len(df_common)} rows to table "
-            f"{schema_name + '.' if schema_name else ''}{COMMON_TABLE_NAME}"
-        )
-        df_common.to_sql(
+        _write_table(
+            df_common,
             COMMON_TABLE_NAME,
             engine,
-            if_exists=if_exists,
-            index=False,
-            dtype={
-                "station_id": INTEGER,
-                "ts": BIGINT,
-                # CHANGED (int data_structure_type) : TEXT -> INTEGER :
-                "data_structure_type": INTEGER,
-            },
-            schema=schema_name,
+            if_exists,
+            DTYPE_COMMON,
         )
-        # CHANGED (logging) : vérification en base après chaque écriture :
-        verify_table_written(COMMON_TABLE_NAME, len(df_common))
 
-    # CHANGED (field catalog) : écriture du catalogue de champs, une
-    # ligne par (data_structure_type, champ) avec type, plage de valeurs
-    # et appartenance à la table commune -> permet une comparaison
-    # visuelle des champs de chaque type de structure.
+    # Catalogue des champs (comparaison visuelle des types) :
     df_catalog = build_field_catalog(df_ajout)
     if not df_catalog.empty:
-        echo_info(
-            f"Writing {len(df_catalog)} field descriptions to table "
-            f"{schema_name + '.' if schema_name else ''}"
-            f"{FIELD_CATALOG_TABLE_NAME}"
-        )
-        df_catalog.to_sql(
+        _write_table(
+            df_catalog,
             FIELD_CATALOG_TABLE_NAME,
             engine,
-            if_exists=if_exists,
-            index=False,
-            dtype={
-                # CHANGED (int data_structure_type) : TEXT -> INTEGER :
-                "data_structure_type": INTEGER,
-                "table_name": TEXT,
-                "field_name": TEXT,
-                "data_type": TEXT,
-                "min_value": NUMERIC,
-                "max_value": NUMERIC,
-                "non_null_count": INTEGER,
-                "total_count": INTEGER,
-                "in_common_table": BOOLEAN,
-            },
-            schema=schema_name,
+            if_exists,
+            DTYPE_CATALOG,
         )
-        # CHANGED (logging) : vérification en base après chaque écriture :
-        verify_table_written(FIELD_CATALOG_TABLE_NAME, len(df_catalog))
 
-    # CHANGED (specific table) : écriture de la table des valeurs NON
-    # communes, dédoublonnées — une ligne par combinaison unique
-    # (station_id, data_structure_type, field_name, value_text),
-    # complément de `weatherlink_common`.
+    # Valeurs des champs non communs :
     df_specific = build_specific_frame(df_ajout)
     if not df_specific.empty:
-        echo_info(
-            f"Writing {len(df_specific)} unique non-common field values "
-            f"to table "
-            f"{schema_name + '.' if schema_name else ''}{SPECIFIC_TABLE_NAME}"
-        )
-        df_specific.to_sql(
+        _write_table(
+            df_specific,
             SPECIFIC_TABLE_NAME,
             engine,
-            if_exists=if_exists,
-            index=False,
-            dtype={
-                "station_id": INTEGER,
-                "data_structure_type": INTEGER,
-                "field_name": TEXT,
-                "value_text": TEXT,
-            },
-            schema=schema_name,
+            if_exists,
+            DTYPE_SPECIFIC,
         )
-        # CHANGED (logging) : vérification en base après chaque écriture :
-        verify_table_written(SPECIFIC_TABLE_NAME, len(df_specific))
 
-    # CHANGED (logging) : récapitulatif final depuis la base elle-même :
+    # Récapitulatif final depuis la base elle-même :
     log_db_tables()
 
-    # Fermeture de la connexion :
     engine.dispose()
-
-
-# --- END CHANGED ---------------------------------------------------------
-
-
-def echo_success(message):
-    """Decore pour le succes du programme click."""
-    click.echo(
-        click.style(
-            message.replace("\n                     ", ""),
-            fg="green",
-        )
-    )
-
-
-def echo_info(message):
-    """Decore pour le succes du programme click."""
-    click.echo(
-        click.style(
-            message.replace("\n                     ", ""),
-            fg="blue",
-        )
-    )
-
-
-def echo_default(message):
-    """Decore pour le succes du programme click."""
-    click.echo(
-        click.style(
-            message.replace("\n                     ", ""),
-            fg="white",
-        )
-    )
-
-
-def echo_failure(message):
-    """Décore en cas d'échéc du programme click."""
-    click.echo(
-        click.style(
-            message.replace("\n                     ", ""),
-            fg="red",
-        )
-    )

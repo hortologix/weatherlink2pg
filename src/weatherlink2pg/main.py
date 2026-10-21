@@ -4,15 +4,15 @@ jusqu'à 00h00 du jour J.
 
 CHANGED (data_structure_type support) : la position du bloc de relevés
 météo dans la réponse de l'API dépend du `gateway_type` de la station.
-La première version supposait que les données se trouvaient toujours dans
-`data["sensors"][0]["data"]` ; avec le nouveau capteur, elles se trouvent
-plus bas dans la liste `sensors`, sous un `data_structure_type`
+La première version supposait que les données se trouvaient toujours
+dans `data["sensors"][0]["data"]` ; avec le nouveau capteur, elles se
+trouvent plus bas dans la liste `sensors`, sous un `data_structure_type`
 correspondant à une entrée « Archive record »
 (cf. https://weatherlink.github.io/v2-api/data-structure-types).
 L'application détecte donc désormais le `data_structure_type` de chaque
 capteur et stocke les données en conséquence : une table par type de
-structure (`{table}_ds{type}`), plus une table `weatherlink_common`
-regroupant les champs communs, une ligne par (station, horodatage)."""
+structure (`{table}_ds{type}`), plus les tables `weatherlink_common`,
+`weatherlink_field_catalog` et `weatherlink_specific`."""
 
 # 1 : Librairies et options
 import warnings
@@ -21,7 +21,7 @@ from typing import Optional
 
 import click
 
-from .helpers import (  # CHANGED (data_structures.log) :
+from .helpers import (
     echo_default,
     echo_failure,
     echo_info,
@@ -39,13 +39,45 @@ from .helpers import (  # CHANGED (data_structures.log) :
 # Ignorer les avertissements FutureWarning : colonnes 100% NaN
 warnings.filterwarnings("ignore", category=FutureWarning)
 
+# Texte d'aide de l'option --archive_only, partagé par les commandes :
+ARCHIVE_ONLY_HELP = (
+    "Ne conserver que les enregistrements « Archive record » "
+    "(types de structure 3, 4, 7, 11, 13, 17, 20, 22, 24, 26)"
+)
+
+
+def _archive_only_option(cmd):
+    """Ajoute l'option --archive_only à une commande click."""
+    return click.option(
+        "--archive_only",
+        "-a",
+        is_flag=True,
+        default=False,
+        help=ARCHIVE_ONLY_HELP,
+    )(cmd)
+
+
+def _download_and_store(
+    station_id: Optional[str],
+    start_ts: int,
+    if_exists: str,
+    archive_only: bool,
+) -> None:
+    """Corps commun aux commandes `full` et `update` : récupération des
+    données via l'API, écriture du journal de débogage puis en base."""
+    stations = get_station_ids() if not station_id else [station_id]
+    end_api = today_ts()
+    df_new = one_day_data(stations, start_ts, end_api, archive_only)
+    # Journal de débogage : structure JSON de chaque type rencontré :
+    write_data_structures_log(df_new)
+    up_to_bdd(df_new, if_exists)
+    echo_success("Le script s'est exécuté avec succès.")
+
 
 # 4 : Utilisation de la routine de récupération des données via click :
 @click.group()
-# @click.option("--debug", default=False)
 def cli():
     """Weatherlink2PG CLI app"""
-    # echo_success(f"Debug mode is {'on' if debug else 'off'}")
 
 
 @cli.command("version")
@@ -71,63 +103,27 @@ def get_stations():
     help="Date la plus ancienne à laquelle remonter (format AAAA-MM-JJ)",
 )
 @click.option("--station_id", "-i", help="ID de la station")
-# CHANGED (archive_only) : option CLI pour ne conserver que les
-# enregistrements « Archive record » :
-@click.option(
-    "--archive_only",
-    "-a",
-    is_flag=True,
-    default=False,
-    help="Ne conserver que les enregistrements « Archive record » "
-    "(types de structure 3, 4, 7, 11, 13, 17, 20, 22, 24, 26)",
-)
+@_archive_only_option
 def full(
     since: Optional[str] = None,
     station_id: Optional[str] = None,
     archive_only: bool = False,
 ):
-    """Commande de récupération des donnes depuis le début de la sonde
+    """Commande de récupération des données depuis le début de la sonde
     avec une réinitialisation de la table."""
     echo_info("Lancement du script de téléchargement complet des données")
     if archive_only:
-        # CHANGED (archive_only) :
         echo_info("Mode « Archive record » uniquement activé")
 
-    stations = (
-        get_station_ids()
-        if not station_id
-        else [
-            station_id,
-        ]
-    )
-    end_api = today_ts()
     first_day_station, if_exists_bdd = start_station(since)
-    # CHANGED (data_structure_type support): one_day_data renvoie un
-    # dictionnaire {data_structure_type: DataFrame}. up_to_bdd écrit
-    # ensuite chaque type de structure de données dans sa propre table
-    # `{table}_ds{type}`, ainsi qu'une table `weatherlink_common`
-    # regroupant les champs communs à tous les types, avec une ligne par
-    # (station_id, ts). La logique en amont est inchangée.
-    df_new = one_day_data(stations, first_day_station, end_api, archive_only)
-    # CHANGED (data_structures.log) : écriture de la structure JSON de
-    # chaque data_structure_type unique rencontré, pour débogage :
-    write_data_structures_log(df_new)
-    up_to_bdd(df_new, if_exists_bdd)
-    echo_success("Le script s'est exécuté avec succès.")
+    _download_and_store(
+        station_id, first_day_station, if_exists_bdd, archive_only
+    )
 
 
 @cli.command("update")
 @click.option("--station_id", "-i", help="ID de la station")
-# CHANGED (archive_only) : option CLI pour ne conserver que les
-# enregistrements « Archive record » :
-@click.option(
-    "--archive_only",
-    "-a",
-    is_flag=True,
-    default=False,
-    help="Ne conserver que les enregistrements « Archive record » "
-    "(types de structure 3, 4, 7, 11, 13, 17, 20, 22, 24, 26)",
-)
+@_archive_only_option
 def update(
     station_id: Optional[str] = None,
     archive_only: bool = False,
@@ -136,32 +132,14 @@ def update(
 
     echo_info("Lancement du script de mise à jour des données")
     if archive_only:
-        # CHANGED (archive_only) :
         echo_info("Mode « Archive record » uniquement activé")
-    stations = (
-        get_station_ids()
-        if not station_id
-        else [
-            station_id,
-        ]
-    )
-    end_api = today_ts()
+
+    # Si la base est encore vide (aucune table `_ds*` ni
+    # `weatherlink_common`), on repart du début par défaut :
     last_ts, if_exists_bdd = last_ts_bdd()
-    # CHANGED (data_structure_type support): correction du fallback
-    # lorsque la base est encore vide (l'original référençait la fonction
-    # start_station elle-même au lieu de sa valeur de retour).
-    # last_ts_bdd renvoie None si aucune table `_ds*` ni `weatherlink_common`
-    # n'existe encore ; dans ce cas on repart du début par défaut.
-    # Le dictionnaire renvoyé par one_day_data est directement transmis à
-    # up_to_bdd (tables par type + table commune `weatherlink_common`).
     if last_ts is None:
         last_ts, _ = start_station(None)
-    df_new = one_day_data(stations, last_ts, end_api, archive_only)
-    # CHANGED (data_structures.log) : écriture de la structure JSON de
-    # chaque data_structure_type unique rencontré, pour débogage :
-    write_data_structures_log(df_new)
-    up_to_bdd(df_new, if_exists_bdd)
-    echo_success("Le script s'est exécuté avec succès.")
+    _download_and_store(station_id, last_ts, if_exists_bdd, archive_only)
 
 
 if __name__ == "__main__":
